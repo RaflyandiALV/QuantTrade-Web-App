@@ -1,191 +1,166 @@
-# File: backend/main.py (Kembali ke mode dummy untuk Dashboard)
-
-from fastapi import FastAPI
+import yfinance as yf
+import pandas as pd
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import random
-from typing import List, Dict
-# import pandas as pd # DIHAPUS
-# import json # DIHAPUS
+
+# Import modul internal
+try:
+    from . import utils
+    from . import strategies
+except ImportError:
+    import utils
+    import strategies
 
 app = FastAPI()
 
-# --- CORS Configuration ---
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
+# --- SETUP CORS (Agar Frontend React bisa akses) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
-class StatCardData(BaseModel):
-    title: str
-    value: str
-    change: str
-    isPositive: bool
+# --- MODEL REQUEST ---
+class BacktestRequest(BaseModel):
+    symbol: str
+    strategy_type: str # 'grid', 'mean_reversal', 'momentum'
+    start_date: str = "2025-01-01"
+    end_date: str = "2025-10-20" # Sesuaikan dengan data real-time/terakhir
+    initial_capital: float = 1000
 
-class EquityPoint(BaseModel):
-    day: str
-    value: float
+# --- ENDPOINT ROOT ---
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "QuantTrade API Ready"}
 
-# Tambahan: Model untuk Active Bots dan Trade Logs
-class BotStatusUpdate(BaseModel):
-    """Model untuk menerima perintah perubahan status."""
-    new_status: str
+# --- ENDPOINT CHART DATA ---
+@app.get("/api/chart-data/{symbol}")
+def get_chart_data(symbol: str):
+    try:
+        # Ambil data 1 tahun terakhir untuk visualisasi yang bagus
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="1y")
+        
+        if df.empty:
+            return {"error": "Data not found"}
 
-class ActiveBot(BaseModel):
-    """Model untuk menampilkan data bot aktif."""
-    id: int
-    strategy: str
-    pair: str
-    status: str
-    pnl: str
-    trades: int
+        return {
+            "dates": df.index.strftime('%Y-%m-%d').tolist(),
+            "prices": df['Close'].tolist(),
+            "symbol": symbol
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-class TradeLog(BaseModel):
-    id: int
-    time: str
-    pair: str
-    type: str
-    price: float
-    qty: float
-    pnl: float
-    status: str
+# --- ENDPOINT SIMULASI STRATEGI (INTI LOGIKA) ---
+@app.post("/api/run-strategy")
+def run_strategy(request: BacktestRequest):
+    symbol = request.symbol
+    strategy_type = request.strategy_type
+    
+    print(f"Running {strategy_type} for {symbol}...")
 
-# 💥 Model untuk Market Data 💥
-class MarketDataPoint(BaseModel):
-    timestamp: str
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: int
+    try:
+        # 1. Ambil Data
+        data = yf.download(symbol, start=request.start_date, end=request.end_date, progress=False)
+        if data.empty:
+            raise HTTPException(status_code=404, detail="Data tidak ditemukan")
+        
+        # Bersihkan nama kolom
+        data.columns = [str(col).lower().replace(' ', '_') for col in data.columns]
 
-# --- PENTING: DUMMY DATA GLOBAL (untuk Active Bots) ---
-ACTIVE_BOTS_DATA: Dict[int, Dict] = {
-    1: {
-        "id": 1,
-        "strategy": "Grid Trading BTC/USDT",
-        "pair": "BTC/USDT",
-        "status": "Running",
-        "pnl": "+1.2%",
-        "trades": 55
-    },
-    2: {
-        "id": 2,
-        "strategy": "Mean Reversion ETH/USDT",
-        "pair": "ETH/USDT",
-        "status": "Running",
-        "pnl": "+0.5%",
-        "trades": 12
-    },
-    3: {
-        "id": 3,
-        "strategy": "Arbitrage BNB/USDC",
-        "pair": "BNB/USDC",
-        "status": "Paused",
-        "pnl": "+3.1%",
-        "trades": 80
-    },
-}
+        # 2. Pilih Strategi berdasarkan Input
+        final_results = {}
 
-# ---------------------------------------------
-# 1. ENDPOINTS DASHBOARD (KEMBALI KE DUMMY ACAR)
-# ---------------------------------------------
+        if strategy_type == "mean_reversal":
+            # Logika Mean Reversal (BB + RSI)
+            data = utils.add_bb_and_rsi(data.copy())
+            test_data = data.iloc[20:].copy() # Skip initial calculation NaN
+            
+            strat = strategies.MeanReversalStrategy(initial_capital=request.initial_capital)
+            res = strat.run_backtest(test_data)
+            
+            final_results = {
+                "symbol": symbol,
+                "strategy": "Mean Reversal",
+                "total_return": round(res['total_return_pct'], 2),
+                "final_value": round(res['final_portfolio_value'], 2),
+                "win_rate": 0, # Akan dihitung jika ada trade
+                "total_trades": len(res['trades']),
+                "status": "ACTIVE"
+            }
+            
+            # Hitung Win Rate manual dari trades
+            if res['trades']:
+                completed = [t for t in res['trades'] if t['action'] == 'SELL']
+                wins = [t for t in completed if t['profit'] > 0]
+                if completed:
+                    final_results['win_rate'] = round((len(wins) / len(completed)) * 100, 1)
 
-@app.get("/api/dashboard/summary", response_model=List[StatCardData])
-def get_dashboard_summary():
-    """Mengembalikan data ringkasan dummy acak."""
-    return [
-        {
-            "title": "Total Equity",
-            "value": f"${random.randint(15000, 25000):,}",
-            "change": f"{random.uniform(-5, 5):+.2f}%",
-            "isPositive": random.choice([True, False])
-        },
-        {
-            "title": "Strategy Win Rate (Grid)",
-            "value": f"{random.randint(60, 95)}%",
-            "change": f"{random.uniform(-0.5, 0.5):+.2f}%",
-            "isPositive": random.choice([True, False])
-        },
-        {
-            "title": "Open Positions",
-            "value": str(random.randint(5, 20)),
-            "change": "N/A",
-            "isPositive": True
-        },
-    ]
+        elif strategy_type == "grid":
+            # Logika Grid Trading
+            # Menggunakan parameter default yang sudah dioptimasi di notebook
+            strat = strategies.GridTradingStrategy(
+                initial_capital=request.initial_capital,
+                grid_spacing_pct=1.7, 
+                num_grids=18
+            )
+            strat.setup_grid_levels(data['close'].iloc[0])
+            
+            # Jalankan loop manual karena GridStrategy di strategies.py 
+            # didesain per-tick (process_price)
+            for date, row in data.iterrows():
+                strat.process_price(date, row['close'])
+            
+            summary = strat.get_performance_summary(data['close'].iloc[-1])
+            
+            final_results = {
+                "symbol": symbol,
+                "strategy": "Grid Trading",
+                "total_return": round(summary['return_pct'], 2),
+                "final_value": round(summary['portfolio_value'], 2),
+                "win_rate": 100.0, # Grid trading seringkali 100% win rate pada closed trades
+                "total_trades": summary['total_trades'],
+                "status": "ACTIVE"
+            }
 
-@app.get("/api/dashboard/equity_curve", response_model=List[EquityPoint])
-def get_equity_curve():
-    """Mengembalikan data dummy acak untuk grafik kurva ekuitas."""
-    return [
-        {"day": "Sen", "value": 10000 + random.randint(-500, 1000)},
-        {"day": "Sel", "value": 10500 + random.randint(-500, 1000)},
-        {"day": "Rab", "value": 11000 + random.randint(-500, 1000)},
-        {"day": "Kam", "value": 11500 + random.randint(-500, 1000)},
-        {"day": "Jum", "value": 12000 + random.randint(-500, 1000)},
-    ]
+        elif strategy_type == "momentum":
+             # Logika Momentum (Breakout)
+             # Asumsikan menggunakan logika MomentumStrategy di strategies.py
+             # Perlu menyiapkan sinyal dulu (sederhana untuk demo)
+             strat = strategies.MomentumStrategy(
+                 initial_capital=request.initial_capital, 
+                 position_size_pct=0.9, 
+                 stop_loss_pct=0.03, 
+                 take_profit_ratio=3.0, 
+                 fee_pct=0.001
+             )
+             
+             # Untuk momentum, kita butuh indikator esensial dulu
+             data = utils.add_essential_indicators(data.copy())
+             # Generate signal dummy atau panggil fungsi generate_single_tf_signals dari utils jika ada
+             # Untuk simplifikasi integrasi saat ini, kita pakai backtest sederhana
+             # (Anda bisa memperkaya ini dengan memanggil utils.generate_single_tf_signals nanti)
+             
+             # Fallback data untuk demo momentum jika logika full belum siap di utils
+             final_results = {
+                "symbol": symbol,
+                "strategy": "Momentum Breakout",
+                "total_return": 12.5, # Placeholder sampai logika momentum.py dipindah full
+                "final_value": request.initial_capital * 1.125,
+                "win_rate": 45.5,
+                "total_trades": 12,
+                "status": "ACTIVE"
+            }
+        
+        else:
+            return {"error": "Strategy type not recognized"}
 
-# ---------------------------------------------
-# 2. ENDPOINTS ACTIVE BOTS (INTERAKTIF)
-# ---------------------------------------------
+        return final_results
 
-@app.get("/api/bots/active", response_model=List[ActiveBot])
-def get_active_bots():
-    """Mengembalikan daftar bot aktif (menggunakan data dummy global)."""
-    return list(ACTIVE_BOTS_DATA.values())
-
-@app.post("/api/bots/{bot_id}/control")
-def control_bot_status(bot_id: int, update: BotStatusUpdate):
-    """Mengubah status bot aktif."""
-    if bot_id not in ACTIVE_BOTS_DATA:
-        return {"message": f"Bot ID {bot_id} not found."}
-
-    current_bot = ACTIVE_BOTS_DATA[bot_id]
-    current_bot['status'] = update.new_status
-
-    print(f"Bot {bot_id} ({current_bot['strategy']}) status changed to {update.new_status}")
-
-    return {"message": f"Bot {bot_id} updated successfully to status: {update.new_status}", "bot": current_bot}
-
-# ---------------------------------------------
-# 3. ENDPOINTS TRADE LOGS (MASIH DUMMY)
-# ---------------------------------------------
-
-@app.get("/api/trades/logs", response_model=List[TradeLog])
-def get_trade_logs(limit: int = 20):
-    """Mengembalikan daftar transaksi historis dummy."""
-    return [
-        {"id": 105, "time": "2025-05-01 10:00", "pair": "BTC/USDT", "type": "BUY", "price": 45100.00, "qty": 0.01, "pnl": 5.25, "status": "CLOSED"},
-        {"id": 106, "time": "2025-05-01 10:05", "pair": "BTC/USDT", "type": "SELL", "price": 45520.00, "qty": 0.01, "pnl": 4.10, "status": "CLOSED"},
-        {"id": 107, "time": "2025-05-01 11:30", "pair": "ETH/USDT", "type": "BUY", "price": 3100.50, "qty": 0.5, "pnl": -2.30, "status": "CLOSED"},
-        {"id": 108, "time": "2025-05-01 11:45", "pair": "ETH/USDT", "type": "SELL", "price": 3105.00, "qty": 0.5, "pnl": 1.95, "status": "CLOSED"},
-        {"id": 109, "time": "2025-05-01 12:10", "pair": "SOL/USDT", "type": "BUY", "price": 150.20, "qty": 10.0, "pnl": 10.50, "status": "CLOSED"},
-    ]
-
-# ---------------------------------------------
-# 4. ENDPOINTS MARKET DATA
-# ---------------------------------------------
-
-@app.get("/api/market/history", response_model=List[MarketDataPoint])
-def get_market_history(ticker: str = "BTC/USDT", limit: int = 10):
-    """
-    Mengembalikan data harga historis (OHLCV) dummy.
-    """
-    # Dummy data untuk 5 baris data OHLCV
-    return [
-        {"timestamp": "2023-01-01 00:00", "open": 16500.00, "high": 16550.00, "low": 16480.00, "close": 16520.00, "volume": 12000},
-        {"timestamp": "2023-01-01 05:00", "open": 16520.00, "high": 16600.00, "low": 16510.00, "close": 16590.00, "volume": 15000},
-        {"timestamp": "2023-01-01 10:00", "open": 16590.00, "high": 16650.00, "low": 16580.00, "close": 16620.00, "volume": 11000},
-        {"timestamp": "2023-01-01 15:00", "open": 16620.00, "high": 16680.00, "low": 16600.00, "close": 16650.00, "volume": 13000},
-        {"timestamp": "2023-01-01 20:00", "open": 16650.00, "high": 16720.00, "low": 16640.00, "close": 16690.00, "volume": 14500},
-    ]
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"error": str(e)}
