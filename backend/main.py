@@ -1,166 +1,205 @@
-import yfinance as yf
-import pandas as pd
+# backend/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# Import modul internal
-try:
-    from . import utils
-    from . import strategies
-except ImportError:
-    import utils
-    import strategies
+from strategy_core import TradingEngine
+import pandas as pd
+from typing import Optional
 
 app = FastAPI()
 
-# --- SETUP CORS (Agar Frontend React bisa akses) ---
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- MODEL REQUEST ---
-class BacktestRequest(BaseModel):
+SECTORS = {
+    "BIG_CAP": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "AVAX-USD"],
+    "AI_COINS": ["FET-USD", "RENDER-USD", "NEAR-USD", "ICP-USD", "GRT-USD", "TAO-USD"],
+    "MEME_COINS": ["DOGE-USD", "SHIB-USD", "PEPE-USD", "WIF-USD", "BONK-USD", "FLOKI-USD"],
+    "EXCHANGE_TOKENS": ["BNB-USD", "OKB-USD", "KCS-USD", "CRO-USD", "LEO-USD"],
+    "DEX_DEFI": ["UNI-USD", "CAKE-USD", "AAVE-USD", "MKR-USD", "LDO-USD", "CRV-USD"],
+    "LAYER_2": ["MATIC-USD", "ARB-USD", "OP-USD", "IMX-USD", "MNT-USD"],
+    "US_TECH": ["NVDA", "TSLA", "AAPL", "MSFT", "AMD", "META", "GOOG"]
+}
+
+class StrategyRequest(BaseModel):
     symbol: str
-    strategy_type: str # 'grid', 'mean_reversal', 'momentum'
-    start_date: str = "2025-01-01"
-    end_date: str = "2025-10-20" # Sesuaikan dengan data real-time/terakhir
-    initial_capital: float = 1000
+    strategy: str
+    capital: float
+    timeframe: str = "1d"
+    period: str = "1y"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
-# --- ENDPOINT ROOT ---
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "QuantTrade API Ready"}
+class ScanRequest(BaseModel):
+    sector: str
+    timeframe: str = "1d" # Ini akan jadi preferensi dasar, tapi kita akan scan variasi
+    period: str = "1y" 
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    capital: float = 10000
 
-# --- ENDPOINT CHART DATA ---
-@app.get("/api/chart-data/{symbol}")
-def get_chart_data(symbol: str):
-    try:
-        # Ambil data 1 tahun terakhir untuk visualisasi yang bagus
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="1y")
-        
-        if df.empty:
-            return {"error": "Data not found"}
+def analyze_market_reason(best_strat, win_rate):
+    if best_strat == "HOLD ONLY": return "🚀 Parabolic Run (Buy & Hold)"
+    elif best_strat == "MOMENTUM": return "📈 Strong Uptrend"
+    elif best_strat == "MULTITIMEFRAME": return "✅ Trend Confirmation"
+    elif best_strat == "GRID": return "〰️ Ranging / Volatile"
+    elif best_strat == "MEAN_REVERSAL": return "🔄 Reversal / Bounce"
+    else: return "❓ Unclear"
 
-        return {
-            "dates": df.index.strftime('%Y-%m-%d').tolist(),
-            "prices": df['Close'].tolist(),
-            "symbol": symbol
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# --- ENDPOINT SIMULASI STRATEGI (INTI LOGIKA) ---
-@app.post("/api/run-strategy")
-def run_strategy(request: BacktestRequest):
-    symbol = request.symbol
-    strategy_type = request.strategy_type
+@app.post("/api/run-backtest")
+def run_backtest(req: StrategyRequest):
+    engine = TradingEngine(initial_capital=req.capital)
+    df = engine.fetch_data(req.symbol, period=req.period, interval=req.timeframe, start_date=req.start_date, end_date=req.end_date)
     
-    print(f"Running {strategy_type} for {symbol}...")
+    if df is None or len(df) < 30:
+        raise HTTPException(status_code=404, detail=f"Data kurang untuk {req.symbol}.")
 
-    try:
-        # 1. Ambil Data
-        data = yf.download(symbol, start=request.start_date, end=request.end_date, progress=False)
-        if data.empty:
-            raise HTTPException(status_code=404, detail="Data tidak ditemukan")
+    df_res, markers, metrics, equity_data = engine.run_backtest(df, req.strategy)
+    
+    chart_data = []
+    line1, line2, line3 = [], [], []
+    
+    for index, row in df_res.iterrows():
+        if pd.isna(row['close']): continue
+        t = int(row['time'].timestamp())
+        chart_data.append({ "time": t, "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close'] })
         
-        # Bersihkan nama kolom
-        data.columns = [str(col).lower().replace(' ', '_') for col in data.columns]
+        if req.strategy == "MOMENTUM":
+            line1.append({"time": t, "value": row['sma_fast']})
+            line2.append({"time": t, "value": row['sma_slow']})
+        elif req.strategy in ["MEAN_REVERSAL", "GRID"]:
+            line1.append({"time": t, "value": row['bb_upper'] if req.strategy == "MEAN_REVERSAL" else row['grid_top']})
+            line2.append({"time": t, "value": row['bb_lower'] if req.strategy == "MEAN_REVERSAL" else row['grid_bottom']})
+            if req.strategy == "GRID": line3.append({"time": t, "value": row['grid_mid']})
+        elif req.strategy == "MULTITIMEFRAME":
+            line3.append({"time": t, "value": row['ema_trend']})
 
-        # 2. Pilih Strategi berdasarkan Input
-        final_results = {}
+    return {
+        "status": "success",
+        "chart_data": chart_data,
+        "equity_curve": equity_data,
+        "indicators": {"line1": line1, "line2": line2, "line3": line3},
+        "markers": markers,
+        "metrics": metrics
+    }
 
-        if strategy_type == "mean_reversal":
-            # Logika Mean Reversal (BB + RSI)
-            data = utils.add_bb_and_rsi(data.copy())
-            test_data = data.iloc[20:].copy() # Skip initial calculation NaN
-            
-            strat = strategies.MeanReversalStrategy(initial_capital=request.initial_capital)
-            res = strat.run_backtest(test_data)
-            
-            final_results = {
-                "symbol": symbol,
-                "strategy": "Mean Reversal",
-                "total_return": round(res['total_return_pct'], 2),
-                "final_value": round(res['final_portfolio_value'], 2),
-                "win_rate": 0, # Akan dihitung jika ada trade
-                "total_trades": len(res['trades']),
-                "status": "ACTIVE"
-            }
-            
-            # Hitung Win Rate manual dari trades
-            if res['trades']:
-                completed = [t for t in res['trades'] if t['action'] == 'SELL']
-                wins = [t for t in completed if t['profit'] > 0]
-                if completed:
-                    final_results['win_rate'] = round((len(wins) / len(completed)) * 100, 1)
+@app.post("/api/compare-strategies")
+def compare_strategies(req: StrategyRequest):
+    engine = TradingEngine(initial_capital=req.capital)
+    df = engine.fetch_data(req.symbol, period=req.period, interval=req.timeframe, start_date=req.start_date, end_date=req.end_date)
+    
+    if df is None or len(df) < 30: raise HTTPException(status_code=404, detail="Data Error")
 
-        elif strategy_type == "grid":
-            # Logika Grid Trading
-            # Menggunakan parameter default yang sudah dioptimasi di notebook
-            strat = strategies.GridTradingStrategy(
-                initial_capital=request.initial_capital,
-                grid_spacing_pct=1.7, 
-                num_grids=18
-            )
-            strat.setup_grid_levels(data['close'].iloc[0])
-            
-            # Jalankan loop manual karena GridStrategy di strategies.py 
-            # didesain per-tick (process_price)
-            for date, row in data.iterrows():
-                strat.process_price(date, row['close'])
-            
-            summary = strat.get_performance_summary(data['close'].iloc[-1])
-            
-            final_results = {
-                "symbol": symbol,
-                "strategy": "Grid Trading",
-                "total_return": round(summary['return_pct'], 2),
-                "final_value": round(summary['portfolio_value'], 2),
-                "win_rate": 100.0, # Grid trading seringkali 100% win rate pada closed trades
-                "total_trades": summary['total_trades'],
-                "status": "ACTIVE"
-            }
-
-        elif strategy_type == "momentum":
-             # Logika Momentum (Breakout)
-             # Asumsikan menggunakan logika MomentumStrategy di strategies.py
-             # Perlu menyiapkan sinyal dulu (sederhana untuk demo)
-             strat = strategies.MomentumStrategy(
-                 initial_capital=request.initial_capital, 
-                 position_size_pct=0.9, 
-                 stop_loss_pct=0.03, 
-                 take_profit_ratio=3.0, 
-                 fee_pct=0.001
-             )
-             
-             # Untuk momentum, kita butuh indikator esensial dulu
-             data = utils.add_essential_indicators(data.copy())
-             # Generate signal dummy atau panggil fungsi generate_single_tf_signals dari utils jika ada
-             # Untuk simplifikasi integrasi saat ini, kita pakai backtest sederhana
-             # (Anda bisa memperkaya ini dengan memanggil utils.generate_single_tf_signals nanti)
-             
-             # Fallback data untuk demo momentum jika logika full belum siap di utils
-             final_results = {
-                "symbol": symbol,
-                "strategy": "Momentum Breakout",
-                "total_return": 12.5, # Placeholder sampai logika momentum.py dipindah full
-                "final_value": request.initial_capital * 1.125,
-                "win_rate": 45.5,
-                "total_trades": 12,
-                "status": "ACTIVE"
-            }
+    results = []
+    strategies = ["MOMENTUM", "MEAN_REVERSAL", "GRID", "MULTITIMEFRAME"]
+    
+    for strat in strategies:
+        _, _, metrics, _ = engine.run_backtest(df.copy(), strat)
+        results.append({
+            "strategy": strat,
+            "net_profit": metrics['net_profit'],
+            "win_rate": metrics['win_rate'],
+            "trades": metrics['total_trades'],
+            "sharpe": metrics.get('sharpe_ratio', 0),
+            "is_hold": False
+        })
+    
+    hold_return_pct = metrics['buy_hold_return']
+    hold_profit_usd = req.capital * (hold_return_pct / 100)
+    
+    results.append({
+        "strategy": "HOLD ONLY",
+        "net_profit": round(hold_profit_usd, 2),
+        "win_rate": 100 if hold_profit_usd > 0 else 0,
+        "trades": 1,
+        "sharpe": 0,
+        "is_hold": True
+    })
         
-        else:
-            return {"error": "Strategy type not recognized"}
+    results.sort(key=lambda x: x['net_profit'], reverse=True)
+    return {"symbol": req.symbol, "comparison": results}
 
-        return final_results
+# --- UPDATED: SMART SCANNER (Multi-TF & Elite Signals) ---
+@app.post("/api/scan-market")
+def scan_market(req: ScanRequest):
+    if req.sector == "ALL":
+        symbols = []
+        for s in SECTORS.values(): symbols.extend(s)
+        symbols = list(set(symbols))[:15] # Limit demi performa
+    else:
+        symbols = SECTORS.get(req.sector, [])
+    
+    if not symbols: raise HTTPException(status_code=404, detail="Sektor tidak ditemukan")
+    
+    engine = TradingEngine(initial_capital=req.capital)
+    strategies = ["MOMENTUM", "MEAN_REVERSAL", "GRID", "MULTITIMEFRAME"]
+    
+    # SETUP SMART SCANNING LOOP
+    # Kita akan scan kombinasi Timeframe untuk mendapatkan hasil terbaik
+    # Prioritas: 1h > 4h > 1d (jika profit beda tipis, ambil TF lebih kecil)
+    scan_tf_options = ["1h", "4h", "1d"] # Timeframe yang diuji
+    # Period yang diuji disederhanakan agar tidak timeout (misal 6mo dan 1y)
+    scan_periods = ["6mo", "1y"] 
+    
+    scan_results = []
+    elite_signals = [] # Menampung kandidat > 70% Winrate
 
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"error": str(e)}
+    for sym in symbols:
+        best_config = None
+        best_profit = -999999999
+        
+        # Loop Timeframe & Period Combination
+        for tf in scan_tf_options:
+            for per in scan_periods:
+                # Fetch data
+                df = engine.fetch_data(sym, period=per, interval=tf)
+                if df is None or len(df) < 40: continue
+                
+                # Test Strategy
+                for strat in strategies:
+                    _, _, metrics, _ = engine.run_backtest(df.copy(), strat)
+                    
+                    # Logic Pemilihan: Cari Profit Maksimal
+                    if metrics['net_profit'] > best_profit:
+                        best_profit = metrics['net_profit']
+                        
+                        # Get Signal Info (Advice)
+                        signal_info = engine.get_signal_advice(df, strat)
+                        
+                        best_config = {
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "period": per,
+                            "strategy": strat,
+                            "profit": metrics['net_profit'],
+                            "win_rate": metrics['win_rate'],
+                            "trades": metrics['total_trades'],
+                            "sharpe": metrics['sharpe_ratio'],
+                            "calmar": metrics['calmar_ratio'],
+                            "signal_data": signal_info # Entry, SL, TP
+                        }
+        
+        if best_config:
+            # Bandingkan dengan HOLD di konfigurasi terbaik
+            # (Simplified: Kita anggap strategi terbaik sudah dipilih diatas)
+            reason = analyze_market_reason(best_config['strategy'], best_config['win_rate'])
+            best_config['reason'] = reason
+            
+            scan_results.append(best_config)
+
+            # FILTER ELITE SIGNALS (>70% Winrate & Min 5 Trades)
+            if best_config['win_rate'] >= 70 and best_config['trades'] >= 5:
+                elite_signals.append(best_config)
+
+    # Sorting Elite Signals:
+    # 1. Win Rate (Desc)
+    # 2. Total Trades (Desc) -> Preferensi user: makin banyak trade makin bagus
+    elite_signals.sort(key=lambda x: (x['win_rate'], x['trades']), reverse=True)
+    top_5_signals = elite_signals[:5]
+
+    return {
+        "sector": req.sector, 
+        "results": scan_results,
+        "elite_signals": top_5_signals # List top 5 untuk UI
+    }
